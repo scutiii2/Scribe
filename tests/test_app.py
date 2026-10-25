@@ -1,0 +1,51 @@
+from dataclasses import replace
+
+from starlette.testclient import TestClient
+
+from src.app import build_app
+from tests.conftest import FakeEngine, audio
+
+ANN = {"X-Requester-Username": "ann"}
+
+
+def make(settings, **changes):
+    return TestClient(build_app(replace(settings, **changes), FakeEngine()))
+
+
+def test_health(settings):
+    assert make(settings).get("/health").json() == {"ok": True}
+
+
+def test_upload_requires_identity(settings):
+    assert make(settings).post("/api/files", content=audio()).status_code == 401
+
+
+def test_upload_ok(settings):
+    response = make(settings).post(
+        "/api/files", content=audio(2.0), headers={**ANN, "X-Filename": "../../a.mp3"}
+    )
+    body = response.json()
+    assert response.status_code == 200 and len(body["file_id"]) == 32
+    assert body["duration_s"] == 2.0 and body["size_bytes"] == len(audio(2.0)) and body["expires_at"] > 0
+
+
+def test_upload_rejects_bad_audio_and_long_audio(settings):
+    c = make(settings)
+    assert c.post("/api/files", content=audio(bad=True), headers=ANN).status_code == 400
+    assert c.post("/api/files", content=audio(11.0), headers=ANN).status_code == 400
+
+
+def test_upload_over_byte_cap_is_413(settings):
+    assert make(settings, max_bytes=10).post("/api/files", content=audio(), headers=ANN).status_code == 413
+
+
+def test_upload_over_quota_is_413(settings):
+    c = make(settings, quota_bytes=10)
+    response = c.post("/api/files", content=audio(), headers=ANN)
+    assert response.status_code == 413 and response.json()["error"] == "quota_exceeded"
+
+
+def test_upload_needs_token_when_configured(settings):
+    c = make(settings, internal_token="secret")
+    assert c.post("/api/files", content=audio(), headers=ANN).status_code == 401
+    assert c.post("/api/files", content=audio(), headers={**ANN, "X-Internal-Token": "secret"}).status_code == 200
