@@ -54,6 +54,7 @@ def build_app(settings: Settings, engine: SttEngine | None = None) -> Starlette:
     async def health(request: Request) -> Response:
         return JSONResponse({"ok": True})
 
+    @mcp.custom_route("/api/transcribe", methods=["POST"])
     @mcp.custom_route("/api/files", methods=["POST"])
     async def upload(request: Request) -> Response:
         owner = request.headers.get("x-requester-username", "").strip()
@@ -67,6 +68,9 @@ def build_app(settings: Settings, engine: SttEngine | None = None) -> Starlette:
         filename = request.headers.get("x-filename", "audio").replace("\\", "/").rsplit("/", 1)[-1][:255] or "audio"
         try:
             stored, expires_at = await service.upload(owner, filename, data)
+            if request.url.path == "/api/transcribe":
+                result = await service.transcribe(owner, stored.file_id, False)
+                return JSONResponse({"text": result.text, "duration_s": result.duration_s})
         except QuotaExceeded as error:
             return JSONResponse({"error": error.code, "message": str(error)}, status_code=413)
         except AudioRejected as error:
