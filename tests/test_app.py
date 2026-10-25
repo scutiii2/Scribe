@@ -49,3 +49,31 @@ def test_upload_needs_token_when_configured(settings):
     c = make(settings, internal_token="secret")
     assert c.post("/api/files", content=audio(), headers=ANN).status_code == 401
     assert c.post("/api/files", content=audio(), headers={**ANN, "X-Internal-Token": "secret"}).status_code == 200
+
+
+def test_dictation_returns_text_and_reuses_cache(settings):
+    engine = FakeEngine()
+    client = TestClient(build_app(settings, engine))
+    for _ in range(2):
+        response = client.post("/api/transcribe", content=audio(2), headers=ANN)
+        assert response.status_code == 200
+        assert response.json() == {"text": "hello world", "duration_s": 2.0}
+    assert engine.transcribe_calls == 1
+
+
+def test_dictation_auth_and_validation(settings):
+    client = make(settings, internal_token="secret")
+    assert client.post("/api/transcribe", content=audio(), headers=ANN).status_code == 401
+    headers = {**ANN, "X-Internal-Token": "secret"}
+    assert client.post("/api/transcribe", content=audio(), headers={"X-Internal-Token": "secret"}).status_code == 401
+    assert client.post("/api/transcribe", content=audio(bad=True), headers=headers).status_code == 400
+    assert client.post("/api/transcribe", content=audio(11), headers=headers).status_code == 400
+    assert make(settings, max_bytes=10).post("/api/transcribe", content=audio(), headers=ANN).status_code == 413
+    assert make(settings, quota_bytes=10).post("/api/transcribe", content=audio(), headers=ANN).status_code == 413
+
+
+def test_dictation_engine_failure_is_503(settings):
+    client = TestClient(build_app(settings, FakeEngine(fail=True)))
+    response = client.post("/api/transcribe", content=audio(), headers=ANN)
+    assert response.status_code == 503
+    assert response.json()["error"] == "engine_failed"
