@@ -28,6 +28,10 @@ class Settings:
     quota_bytes: int = 200 * 1024 * 1024
     concurrency: int = 1
     timeout_s: int = 110
+    stream_capacity: int = 2
+    stream_max_frame_bytes: int = 64000
+    stream_idle_s: float = 15
+    stream_window_s: float = 30
 
     @property
     def audio_dir(self) -> Path:
@@ -63,4 +67,8 @@ def load_settings() -> Settings:
         quota_bytes=int(env("SCRIBE_QUOTA_MB", "200")) * 1024 * 1024,
         concurrency=int(env("SCRIBE_CONCURRENCY", "1")),
         timeout_s=int(env("SCRIBE_TIMEOUT_S", "110")),
+        stream_capacity=int(env("SCRIBE_STREAM_CAPACITY", "2")),
+        stream_max_frame_bytes=int(env("SCRIBE_STREAM_MAX_FRAME_BYTES", "64000")),
+        stream_idle_s=float(env("SCRIBE_STREAM_IDLE_S", "15")),
+        stream_window_s=float(env("SCRIBE_STREAM_WINDOW_S", "30")),
     )

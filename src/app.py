@@ -11,6 +11,8 @@ from pydantic import Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.websockets import WebSocket
+from starlette.routing import WebSocketRoute
 
 from src.config import Settings
 from src.contract import TranscribeResult
@@ -20,6 +22,7 @@ from src.identity import owner_from_context
 from src.middleware import InternalTokenMiddleware
 from src.service import ScribeService
 from src.store import AudioStore
+from src.streaming import serve_stream
 
 INSTRUCTIONS = (
     "Speech to text (English). The user attaches an audio file in chat; the question then contains a line "
@@ -28,7 +31,10 @@ INSTRUCTIONS = (
 
 
 def build_app(settings: Settings, engine: SttEngine | None = None) -> Starlette:
-    engine = engine or WhisperEngine(settings.models_dir, settings.model, settings.ffmpeg)
+    engine = engine or WhisperEngine(
+        settings.models_dir, settings.model, settings.ffmpeg,
+        max_seconds=settings.max_seconds, decode_timeout_s=settings.timeout_s,
+    )
     store = AudioStore(settings.audio_dir, settings.ttl_seconds, settings.quota_bytes)
     store.sweep()
     service = ScribeService(engine, store, settings)
@@ -84,6 +90,34 @@ def build_app(settings: Settings, engine: SttEngine | None = None) -> Starlette:
             "size_bytes": stored.size_bytes, "expires_at": expires_at,
         })
 
+    @mcp.custom_route("/api/transcribe-partial", methods=["POST"])
+    async def partial(request: Request) -> Response:
+        owner = request.headers.get("x-requester-username", "").strip()
+        if not owner:
+            return JSONResponse({"error": "identity_required"}, status_code=401)
+        if not service.acquire_partial():
+            return JSONResponse({"error": "stream_capacity", "message": "Dictation is busy. Try again."}, status_code=503)
+        try:
+            data = bytearray()
+            async for chunk in request.stream():
+                data.extend(chunk)
+                if len(data) > settings.max_bytes:
+                    return JSONResponse({"error": "too_large"}, status_code=413)
+            text, duration = await service.partial(owner, bytes(data))
+            return JSONResponse({"text": text, "duration_s": duration})
+        except QuotaExceeded:
+            return JSONResponse({"error": "quota_exceeded", "message": "Your audio storage is full."}, status_code=413)
+        except AudioRejected:
+            return JSONResponse({"error": "audio_rejected", "message": "That audio cannot be transcribed."}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "engine_failed", "message": "Transcription failed. Try again."}, status_code=503)
+        finally:
+            service.release_partial()
+
+    async def stream(websocket: WebSocket) -> None:
+        await serve_stream(websocket, service, settings)
+
     app = mcp.streamable_http_app()
+    app.router.routes.append(WebSocketRoute("/api/stream", stream))
     app.add_middleware(InternalTokenMiddleware, token=settings.internal_token)
     return app

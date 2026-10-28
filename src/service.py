@@ -18,6 +18,83 @@ class ScribeService:
         self._engine, self._store, self._settings = engine, store, settings
         self._slots = asyncio.Semaphore(settings.concurrency)
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._inflight: set[asyncio.Task] = set()
+        self._live = 0
+        self._partials = 0
+        self._reservations: dict[object, tuple[str, int]] = {}
+        self._quota_lock = asyncio.Lock()
+
+    def acquire_live(self) -> bool:
+        if self._live >= self._settings.stream_capacity:
+            return False
+        self._live += 1
+        return True
+
+    def release_live(self) -> None:
+        self._live -= 1
+
+    def acquire_partial(self) -> bool:
+        if self._partials >= self._settings.stream_capacity:
+            return False
+        self._partials += 1
+        return True
+
+    def release_partial(self) -> None:
+        self._partials -= 1
+
+    async def reserve(self, key: object, owner: str, size: int) -> None:
+        async with self._quota_lock:
+            total = size + sum(n for k, (who, n) in self._reservations.items() if k is not key and who == owner)
+            await asyncio.to_thread(self._store.check_quota, owner, total)
+            self._reservations[key] = (owner, size)
+
+    def unreserve(self, key: object) -> None:
+        self._reservations.pop(key, None)
+
+    async def infer(self, pcm: bytes):
+        # The task owns the slot until the worker really finishes. Cancelling a
+        # to_thread await cannot stop Whisper and must never free its slot early.
+        started = False
+        async def run():
+            nonlocal started
+            async with self._slots:
+                started = True
+                return await self._engine.transcribe(pcm)
+
+        task = asyncio.create_task(run())
+        self._inflight.add(task)
+        def completed(done):
+            self._inflight.discard(done)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(completed)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), self._settings.timeout_s)
+        except TimeoutError as error:
+            # Cancel only queued work; running work keeps its slot.
+            if not started:
+                task.cancel()
+            raise EngineFailed("Transcription took too long. Try a shorter file.") from error
+        except asyncio.CancelledError:
+            if not started:
+                task.cancel()
+            raise
+        except Exception as error:
+            raise EngineFailed("Transcription failed. Try again.") from error
+
+    async def partial(self, owner: str, data: bytes) -> tuple[str, float]:
+        key = object()
+        try:
+            await self.reserve(key, owner, len(data))
+            pcm = await self._decode(data)
+            await self.reserve(key, owner, max(len(data), len(pcm)))
+            duration = len(pcm) / PCM_BYTES_PER_SECOND
+            if duration > min(150, self._settings.max_seconds):
+                raise AudioRejected("That audio is too long.")
+            result = await self.infer(pcm)
+            return result.text, duration
+        finally:
+            self.unreserve(key)
 
     async def upload(self, owner: str, filename: str, data: bytes) -> tuple[StoredAudio, float]:
         if not owner:
@@ -26,10 +103,16 @@ class ScribeService:
         if duration > self._settings.max_seconds:
             raise AudioRejected(f"That audio is longer than {self._settings.max_seconds} seconds.")
         file_id = AudioStore.file_id(owner, data)
-        stored = await asyncio.to_thread(self._store.put, owner, file_id, data, filename, duration)
+        async with self._quota_lock:
+            reserved = sum(n for who, n in self._reservations.values() if who == owner)
+            await asyncio.to_thread(self._store.check_quota, owner, reserved + len(data))
+            stored = await asyncio.to_thread(self._store.put, owner, file_id, data, filename, duration)
         return stored, self._store.expires_at(stored)
 
     async def _probe(self, data: bytes) -> float:
+        return len(await self._decode(data)) / PCM_BYTES_PER_SECOND
+
+    async def _decode(self, data: bytes) -> bytes:
         """Decode a temporary copy: ffmpeg needs a seekable file for some formats (m4a)."""
         staging = self._settings.staging_dir
         await asyncio.to_thread(staging.mkdir, parents=True, exist_ok=True)
@@ -42,7 +125,7 @@ class ScribeService:
 
         path = await asyncio.to_thread(write)
         try:
-            return len(await self._engine.decode(path)) / PCM_BYTES_PER_SECOND
+            return await self._engine.decode(path)
         finally:
             await asyncio.to_thread(path.unlink, missing_ok=True)
 
@@ -72,11 +155,7 @@ class ScribeService:
 
     async def _run(self, owner: str, stored: StoredAudio) -> dict:
         pcm = await self._engine.decode(stored.path)
-        try:
-            async with self._slots:
-                transcript = await asyncio.wait_for(self._engine.transcribe(pcm), self._settings.timeout_s)
-        except TimeoutError as error:
-            raise EngineFailed("Transcription took too long. Try a shorter file.") from error
+        transcript = await self.infer(pcm)
         payload = {
             "text": transcript.text, "language": transcript.language,
             "segments": [{"start_s": s.start_s, "end_s": s.end_s, "text": s.text} for s in transcript.segments],
