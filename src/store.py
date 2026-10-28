@@ -115,6 +115,13 @@ class AudioStore:
         self._write(owner_dir / f"{file_id}.bin", data)
         return StoredAudio(file_id, owner_dir / f"{file_id}.bin", filename, duration_s, len(data), created)
 
+    def check_quota(self, owner: str, additional_bytes: int) -> None:
+        owner_dir = self._owner_dir(owner)
+        self._sweep_dir(owner_dir)
+        used = sum(p.stat().st_size for p in owner_dir.glob("*.bin"))
+        if used + additional_bytes > self._quota:
+            raise QuotaExceeded("Your audio storage is full. Wait for older audio to expire and try again.")
+
     def get_transcript(self, owner: str, file_id: str, model: str) -> dict | None:
         if not _ID.match(file_id):
             return None
